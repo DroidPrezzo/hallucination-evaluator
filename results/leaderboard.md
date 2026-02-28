@@ -1,0 +1,9 @@
+# Context Probing Hallucination Leaderboard
+
+| Model                           | 2000 Tokens (Hallucination Rate)   | 4000 Tokens (Hallucination Rate)   | 6000 Tokens (Hallucination Rate)   | 8000 Tokens (Hallucination Rate)   |
+|:--------------------------------|:-----------------------------------|:-----------------------------------|:-----------------------------------|:-----------------------------------|
+| Qwen/Qwen2.5-1.5B-Instruct      | 40.0%                              | 50.0%                              | 60.0%                              | 80.0%                              |
+| microsoft/Phi-3.5-mini-instruct | 30.0%                              | 90.0%                              | 40.0%                              | 60.0%                              |
+| Qwen/Qwen2.5-3B-Instruct        | 40.0%                              | 30.0%                              | 50.0%                              | 60.0%                              |
+
+*Lower is better. Represents the percentage of summaries at that context length containing at least one unfaithful fact.*

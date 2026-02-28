@@ -1,0 +1,9 @@
+transformers
+torch
+datasets
+accelerate
+pandas
+tqdm
+bitsandbytes
+jinja2
+tabulate

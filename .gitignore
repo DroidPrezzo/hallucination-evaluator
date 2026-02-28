@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Hugging Face caches (Optional, usually stored in ~/.cache/huggingface)
+.cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Results
+# (We might want to ignore intermediate results, but keep the folder structure)
+# results/*
+# !results/.gitkeep
