@@ -22,10 +22,21 @@ def parse_args():
                         default=["Qwen/Qwen2.5-1.5B-Instruct", "microsoft/Phi-3.5-mini-instruct", "Qwen/Qwen2.5-3B-Instruct"],
                         help="List of Hugging Face model IDs to evaluate")
                         
-    # Judge Model: The highly capable "source of truth" used to evaluate the 
+    # Judge Model: The highly capable "source of truth" used to evaluate the
     # factual faithfulness of the Target Models' summaries. Needs to be larger and instruct-tuned.
     parser.add_argument("--judge-model", type=str, default="Qwen/Qwen2.5-7B-Instruct",
                         help="Hugging Face model ID to use as the fact-checking judge")
+
+    # Revision pinning (CWE-494): pin Hub downloads to immutable commit SHAs (or tags/branches)
+    # for reproducible, integrity-checked loads. Left unset, each load resolves to the repo's
+    # default branch and emits a warning.
+    parser.add_argument("--model-revisions", nargs="+", default=None,
+                        help="Hub revisions for --models, in the same order (commit SHA/tag/branch). "
+                             "Must match the number of --models if provided.")
+    parser.add_argument("--judge-revision", type=str, default=None,
+                        help="Hub revision (commit SHA/tag/branch) for the judge model")
+    parser.add_argument("--dataset-revision", type=str, default=None,
+                        help="Hub revision (commit SHA/tag/branch) for the evaluation dataset")
                         
     # The varying lengths of text (in tokens) we will feed the models. 
     # As this increases, hallucination rates typically spike.
@@ -54,6 +65,14 @@ def setup_logging():
     """Configures fundamental console logging for tracking evaluation progress."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 
+def release_runner(runner):
+    """Frees a ModelRunner's weights and reclaims GPU memory before loading the next model."""
+    del runner.model
+    del runner.tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 def main():
     """
     Main entry point for the pipeline. Executes the following phases:
@@ -75,9 +94,17 @@ def main():
     logger.info(f"Context Lengths: {args.context_lengths}")
     logger.info(f"Samples per length: {args.samples}")
     
+    # Validate that per-model revisions, if supplied, line up with the model list
+    if args.model_revisions is not None and len(args.model_revisions) != len(args.models):
+        logger.error(
+            f"--model-revisions has {len(args.model_revisions)} entries but --models has "
+            f"{len(args.models)}; they must match one-to-one."
+        )
+        sys.exit(1)
+
     # 1. Setup Context Builder (Downloads/caches dataset)
     logger.info("Initializing Context Builder (Dataset)")
-    context_builder = ContextBuilder(dataset_name="tau/scrolls", subset="gov_report", split="validation")
+    context_builder = ContextBuilder(dataset_name="tau/scrolls", subset="gov_report", split="validation", revision=args.dataset_revision)
     
     # 2. Setup Leaderboard generator
     leaderboard_gen = LeaderboardGenerator(output_dir=args.output_dir)
@@ -86,17 +113,20 @@ def main():
     all_generated_summaries = {}
     
     # Phase 1: Iteratively generate summaries for each target model
-    for model_name in args.models:
+    for idx, model_name in enumerate(args.models):
         logger.info("\n====================================")
         logger.info(f"PHASE 1: Generating Summaries - Target Model: {model_name}")
-        
+
+        model_revision = args.model_revisions[idx] if args.model_revisions is not None else None
+
         # Load test model
         try:
             test_runner = ModelRunner(
-                model_name=model_name, 
+                model_name=model_name,
                 cache_dir=args.cache_dir,
                 load_in_4bit=args.use_4bit,
-                load_in_8bit=args.use_8bit
+                load_in_8bit=args.use_8bit,
+                revision=model_revision
             )
         except Exception as e:
             logger.error(f"Failed to load target model {model_name}: {e}. Skipping.")
@@ -116,14 +146,10 @@ def main():
         
         # Clear VRAM for the next model to avoid OOM
         logger.info(f"Releasing resources for {model_name} before proceeding.")
-        del test_runner.model
-        del test_runner.tokenizer
+        release_runner(test_runner)
         del test_runner
         del evaluator
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
+
     if not all_generated_summaries:
          logger.error("No valid models could generate summaries, skipping evaluation phase.")
          sys.exit(1)
@@ -135,10 +161,11 @@ def main():
     judge_4bit = args.use_4bit or args.judge_4bit
     try:
         judge_runner = ModelRunner(
-            model_name=args.judge_model, 
+            model_name=args.judge_model,
             cache_dir=args.cache_dir,
             load_in_4bit=judge_4bit,
-            load_in_8bit=args.use_8bit and not judge_4bit
+            load_in_8bit=args.use_8bit and not judge_4bit,
+            revision=args.judge_revision
         )
         judge = LLMJudge(judge_model_runner=judge_runner)
     except Exception as e:

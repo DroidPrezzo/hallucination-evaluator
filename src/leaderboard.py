@@ -1,7 +1,20 @@
 import pandas as pd
-from typing import Dict, List
+from typing import Dict
 import logging
 import os
+
+
+def _sanitize_csv_cell(value):
+    """
+    Neutralizes spreadsheet formula injection (OWASP LLM05: Improper Output Handling).
+    A model name (or any future model-derived field) beginning with =, +, -, or @ is
+    treated as a formula by Excel/Sheets; prefixing a single quote forces it to render
+    as plain text when the leaderboard CSV is opened.
+    """
+    if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
 
 class LeaderboardGenerator:
     """
@@ -33,7 +46,7 @@ class LeaderboardGenerator:
         
         data = []
         for model, model_results in results.items():
-            row = {"Model": model}
+            row = {"Model": _sanitize_csv_cell(model)}
             for length in sorted_lengths:
                 # Format as percentage entirely for easy reading
                 if length in model_results:

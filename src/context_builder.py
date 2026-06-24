@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, Optional
+from typing import Optional
 
 from datasets import load_dataset
 from transformers import PreTrainedTokenizer
@@ -7,18 +7,24 @@ from transformers import PreTrainedTokenizer
 
 class ContextBuilder:
     """
-    Responsible for loading source documents and truncating them to specific 
+    Responsible for loading source documents and truncating them to specific
     token lengths to build context windows for model probing.
     """
-    def __init__(self, dataset_name: str = "tau/scrolls", subset: str = "gov_report", split: str = "validation"):
+    def __init__(self, dataset_name: str = "tau/scrolls", subset: str = "gov_report", split: str = "validation", revision: Optional[str] = None):
         self.dataset_name = dataset_name
         self.subset = subset
         self.split = split
+        self.revision = revision
         self.logger = logging.getLogger(__name__)
-        
-        self.logger.info(f"Loading dataset {dataset_name} ({subset}) split: {split}")
+
+        if revision is None:
+            self.logger.warning(
+                f"No revision pinned for dataset {dataset_name}; loading from the default branch. "
+                "Pin an immutable commit SHA for reproducible, integrity-checked data (CWE-494)."
+            )
+        self.logger.info(f"Loading dataset {dataset_name} ({subset}) split: {split} (revision={revision or 'default'})")
         try:
-            self.dataset = load_dataset(dataset_name, subset, split=split)
+            self.dataset = load_dataset(dataset_name, subset, split=split, revision=revision)
         except Exception as e:
             self.logger.error(f"Failed to load dataset: {e}")
             raise
@@ -57,9 +63,19 @@ class ContextBuilder:
         Returns:
             The truncated text as a string.
         """
+        # OWASP LLM10 (Unbounded Consumption): cap the text at the character level BEFORE
+        # tokenizing. Since we only ever keep `target_length` tokens, tokenizing a
+        # pathologically large document in full would waste memory/CPU for no benefit.
+        # ~8 characters per token is a generous upper bound, so this never truncates content
+        # that would have survived the token-level cut below.
+        max_chars = target_length * 8
+        if len(text) > max_chars:
+            self.logger.debug(f"Pre-trimming document from {len(text)} to {max_chars} chars before tokenization (LLM10 guard).")
+            text = text[:max_chars]
+
         # Tokenize without adding special tokens (BOS, EOS, etc) as we just want to truncate the content
         tokens = tokenizer.encode(text, add_special_tokens=False)
-        
+
         if len(tokens) <= target_length:
             self.logger.debug(f"Document token length ({len(tokens)}) is <= target length ({target_length}). Returning full text.")
             return text
