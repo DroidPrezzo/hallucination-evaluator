@@ -18,6 +18,7 @@ In the field of AI security, understanding the operational boundaries of an LLM 
 - **Dynamic Context Sizing:** Automatically downloads the `tau/scrolls` governmental report dataset and strictly truncates it to test exact token boundaries.
 - **LLM-as-a-Judge:** Uses a capable instruct model (e.g., `Qwen2.5-7B-Instruct`) to fact-check generated summaries strictly against the original source text.
 - **VRAM Optimized:** Built-in support for 4-bit and 8-bit quantization to run large context evaluations on consumer GPUs.
+- **Security Hardened:** Aligned with the [OWASP Top 10 for LLM Applications](https://owasp.org/www-project-top-10-for-large-language-model-applications/). The judge and summarizer treat document/summary text as untrusted data and resist embedded prompt-injection (LLM01); the supply chain is pinned via versioned dependencies, optional Hub revision pinning, and `trust_remote_code=False` (LLM03/LLM04).
 
 ## Installation
 
@@ -57,15 +58,32 @@ python main.py \
   --judge-4bit
 ```
 
+### Reproducible & Integrity-Checked Runs
+
+By default, models and the dataset load from their Hub default branch (and a warning is logged). For reproducible benchmarks and to defend against a silently-updated or compromised upstream repo, pin every download to an immutable commit SHA:
+
+```bash
+python main.py \
+  --models Qwen/Qwen2.5-7B-Instruct \
+  --model-revisions <commit-sha> \
+  --judge-model Qwen/Qwen2.5-7B-Instruct \
+  --judge-revision <commit-sha> \
+  --dataset-revision <commit-sha>
+```
+
 ### CLI Arguments
 
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `--models` | Space-separated list of Hugging Face model IDs to test. | `Qwen/Qwen2.5-1.5B...` |
+| `--models` | Space-separated list of Hugging Face model IDs to test. | `Qwen/Qwen2.5-1.5B-Instruct microsoft/Phi-3.5-mini-instruct Qwen/Qwen2.5-3B-Instruct` |
 | `--judge-model` | The Hugging Face model ID used to fact-check summaries. | `Qwen/Qwen2.5-7B-Instruct` |
+| `--model-revisions` | Hub revisions (commit SHA/tag/branch) for `--models`, in the same order. Must match the count of `--models` if given. | `None` |
+| `--judge-revision` | Hub revision (commit SHA/tag/branch) to pin the judge model. | `None` |
+| `--dataset-revision` | Hub revision (commit SHA/tag/branch) to pin the evaluation dataset. | `None` |
 | `--context-lengths` | The token limits to test the models at. | `1000 2000 4000 8000` |
 | `--samples` | Number of documents to summarize and evaluate per length. | `10` |
 | `--output-dir` | Directory to save the final `leaderboard.md`. | `results` |
+| `--cache-dir` | Hugging Face cache directory for downloaded weights. | `None` |
 | `--use-4bit` | Loads target models in 4-bit precision (saves massive VRAM). | `False` |
 | `--use-8bit` | Loads target models in 8-bit precision. | `False` |
 | `--judge-4bit` | Forces the judge model to load in 4-bit precision. | `False` |
@@ -77,4 +95,4 @@ Once the pipeline completes both the Generation and Evaluation phases for all mo
 *Note: A 0.00 rate means the model summarized the text perfectly faithfully 100% of the time. Higher rates mean the model is hallucinating facts not present in the source text.*
 
 ## Acknowledgments
-A special thanks to **Antigravity** (the Google DeepMind agentic coding assistant) for their extensive help in scaffolding, optimizing, and debugging this evaluation pipeline.
+Co-authored by **Claude Code** (Anthropic's agentic coding assistant), which assisted in refactoring, security and CVE remediation, OWASP LLM Top 10 hardening, and debugging this evaluation pipeline.
