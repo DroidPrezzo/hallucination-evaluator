@@ -1,0 +1,45 @@
+# Per-model pricing: USD per 1 million tokens.
+#
+# When input exceeds a tier's `above_input_tokens` threshold, the entire
+# request is billed at that tier's rates (not just the excess).
+#
+# Verify these values against provider pricing pages before running.
+# Last checked: 2026-07-19
+
+models:
+  # --- OpenAI ---
+  gpt-5.5:
+    input_per_1m: 2.00
+    output_per_1m: 8.00
+    tiers:
+      - above_input_tokens: 272000
+        input_per_1m: 4.00
+        output_per_1m: 16.00
+
+  # --- Anthropic ---
+  claude-opus-4-8:
+    input_per_1m: 15.00
+    output_per_1m: 75.00
+
+  claude-sonnet-4-5:
+    input_per_1m: 3.00
+    output_per_1m: 15.00
+
+  # --- xAI (via OpenAI-compat) ---
+  grok-4.5:
+    input_per_1m: 3.00
+    output_per_1m: 15.00
+    tiers:
+      - above_input_tokens: 200000
+        input_per_1m: 6.00
+        output_per_1m: 30.00
+
+  # --- Moonshot (via OpenAI-compat) ---
+  kimi-k3:
+    input_per_1m: 0.60
+    output_per_1m: 2.40
+
+  # --- DeepSeek (via OpenAI-compat) ---
+  deepseek-chat:
+    input_per_1m: 0.27
+    output_per_1m: 1.10

@@ -56,8 +56,21 @@ def parse_args():
                         help="Load models in 4-bit quantization to save VRAM (requires bitsandbytes)")
     parser.add_argument("--use-8bit", action="store_true", 
                         help="Load models in 8-bit quantization to save VRAM")
-    parser.add_argument("--judge-4bit", action="store_true", 
+    parser.add_argument("--judge-4bit", action="store_true",
                         help="Load the Judge model in 4-bit even if test models aren't")
+
+    # --- API backend flags (Phase 1) ---
+    parser.add_argument("--model-spec", action="append", default=None,
+                        help="Model backend spec (repeatable). E.g. openai:gpt-5.5, "
+                             "anthropic:claude-opus-4-8, "
+                             "openai:grok-4.5?base_url=https://api.x.ai/v1&key_env=XAI_API_KEY. "
+                             "Overrides --models when set.")
+    parser.add_argument("--judge-spec", type=str, default=None,
+                        help="Judge model backend spec. E.g. anthropic:claude-opus-4-8. "
+                             "Overrides --judge-model when set.")
+    parser.add_argument("--max-concurrency", type=int, default=2,
+                        help="Max concurrent API requests per provider (default: 2). "
+                             "Forced to 1 when requested_context_tokens >= 256k.")
 
     return parser.parse_args()
 
