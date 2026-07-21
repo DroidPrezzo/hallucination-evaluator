@@ -7,13 +7,14 @@ import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 from tqdm import tqdm
 
 from src.backends import ModelBackend, create_backend
 from src.backends.base import GenerationResult
 from src.context_builder import ContextBuilder
+from src.corpus import Corpus, ScrollsSource
 from src.judging import decompose_summary, select_source, verify_claim
 from src.judging.claims import DECOMPOSE_MAX_TOKENS, VERIFY_MAX_TOKENS
 from src.leaderboard import LeaderboardGenerator
@@ -30,6 +31,11 @@ from src.prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A document source is any object exposing get_document_length / get_document /
+# get_doc_id / get_contamination_risk plus a `name` attribute (Corpus or
+# ScrollsSource).
+DocumentSource = Union[Corpus, ScrollsSource]
 
 # Parameters that affect output — logged into config.json for reproducibility.
 GEN_MAX_TOKENS = 512
@@ -121,7 +127,7 @@ def _process_concurrently(
 
 
 def _make_generation_worker(
-    backend: ModelBackend, spec: str, context_builder: ContextBuilder
+    backend: ModelBackend, spec: str, source: DocumentSource
 ) -> Callable[[tuple[int, int]], tuple[str, str, dict]]:
     """Build a worker that produces (generation_key, context, record) for a doc.
 
@@ -131,14 +137,16 @@ def _make_generation_worker(
 
     def worker(task: tuple[int, int]) -> tuple[str, str, dict]:
         doc_idx, length = task
-        doc_id = f"scrolls:{doc_idx}"
+        doc_id = source.get_doc_id(doc_idx)
+        corpus = source.name
+        contamination_risk = source.get_contamination_risk(doc_idx)
         key = _generation_key(spec, doc_id, length, PROMPT_VERSION)
 
         context = ""
         source_sha = ""
         local_token_count = 0
         try:
-            doc = context_builder.get_document(doc_idx)
+            doc = source.get_document(doc_idx)
             context = backend.truncate(doc, length)
             source_sha = hashlib.sha256(context.encode()).hexdigest()
             prompt = build_summarize_prompt(context)
@@ -154,7 +162,8 @@ def _make_generation_worker(
                 "idempotency_key": key,
                 "doc_id": doc_id,
                 "source_sha256": source_sha,
-                "corpus": "scrolls",
+                "corpus": corpus,
+                "contamination_risk": contamination_risk,
                 "model_spec": spec,
                 "requested_context_tokens": length,
                 "actual_input_tokens_model_tokenizer": local_token_count,
@@ -176,7 +185,8 @@ def _make_generation_worker(
                 "idempotency_key": key,
                 "doc_id": doc_id,
                 "source_sha256": source_sha,
-                "corpus": "scrolls",
+                "corpus": corpus,
+                "contamination_risk": contamination_risk,
                 "model_spec": spec,
                 "requested_context_tokens": length,
                 "actual_input_tokens_model_tokenizer": local_token_count,
@@ -530,12 +540,23 @@ def run_backend_pipeline(args: argparse.Namespace) -> None:
     store = RunStore(run_id, args.output_dir)
 
     dataset_revision = getattr(args, "dataset_revision", None)
-    context_builder = ContextBuilder(
-        dataset_name="tau/scrolls",
-        subset="gov_report",
-        split="validation",
-        revision=dataset_revision,
-    )
+    corpus_path = getattr(args, "corpus", None)
+    source: DocumentSource
+    if corpus_path:
+        source = Corpus(corpus_path)
+        logger.info(
+            "Document source: corpus '%s' (%d records)",
+            source.name, source.get_document_length(),
+        )
+    else:
+        source = ScrollsSource(
+            ContextBuilder(
+                dataset_name="tau/scrolls",
+                subset="gov_report",
+                split="validation",
+                revision=dataset_revision,
+            )
+        )
 
     existing_config = store.load_config()
     calibrations: dict[str, float] = (
@@ -581,16 +602,21 @@ def run_backend_pipeline(args: argparse.Namespace) -> None:
         "git_commit": _git_commit_hash(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "calibrations": calibrations,
-        "dataset": {
-            "name": "tau/scrolls",
-            "subset": "gov_report",
-            "split": "validation",
-            "revision": dataset_revision,
+        "document_source": {
+            "type": "corpus" if corpus_path else "hf_dataset",
+            "name": source.name,
+            "path": corpus_path,
+            "hf_dataset": None if corpus_path else {
+                "name": "tau/scrolls",
+                "subset": "gov_report",
+                "split": "validation",
+                "revision": dataset_revision,
+            },
         },
     }
     store.save_config(config)
 
-    dataset_len = context_builder.get_document_length()
+    dataset_len = source.get_document_length()
     actual_samples = min(args.samples, dataset_len)
 
     # ------------------------------------------------------------------
@@ -611,14 +637,14 @@ def run_backend_pipeline(args: argparse.Namespace) -> None:
         backend = create_backend(spec, cache_dir=getattr(args, "cache_dir", None))
         _apply_calibration(backend, spec, calibrations, config, store)
 
-        worker = _make_generation_worker(backend, spec, context_builder)
+        worker = _make_generation_worker(backend, spec, source)
         total = len(args.context_lengths) * actual_samples
         with tqdm(total=total, desc=spec, unit="gen") as pbar:
             for length in args.context_lengths:
                 pending: list[tuple[int, int]] = []
                 for doc_idx in range(actual_samples):
                     key = _generation_key(
-                        spec, f"scrolls:{doc_idx}", length, PROMPT_VERSION
+                        spec, source.get_doc_id(doc_idx), length, PROMPT_VERSION
                     )
                     if store.has_generation(key):
                         pbar.update()

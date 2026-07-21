@@ -92,6 +92,10 @@ def parse_args():
     parser.add_argument("--run-id", type=str, default=None,
                         help="Run ID for persistence/resume. Omit to auto-generate. "
                              "Pass an existing ID to resume a previous run.")
+    parser.add_argument("--corpus", type=str, default=None,
+                        help="Path to a corpus JSONL built by scripts/build_corpus.py "
+                             "(contamination-safe docs/bundles). Overrides the default "
+                             "tau/scrolls dataset for API runs.")
 
     return parser.parse_args()
 
