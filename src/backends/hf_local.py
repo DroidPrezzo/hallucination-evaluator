@@ -87,6 +87,17 @@ class HFLocalBackend(ModelBackend):
     def count_tokens(self, text: str) -> int:
         return len(self._runner.tokenizer.encode(text, add_special_tokens=False))
 
+    def truncate(self, text: str, target_length: int) -> str:
+        max_chars = target_length * 8
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        tokens = self._runner.tokenizer.encode(text, add_special_tokens=False)
+        if len(tokens) <= target_length:
+            return text
+        return self._runner.tokenizer.decode(
+            tokens[:target_length], skip_special_tokens=True
+        )
+
     def release(self) -> None:
         import gc
 

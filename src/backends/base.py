@@ -42,3 +42,13 @@ class ModelBackend(ABC):
 
     @abstractmethod
     def count_tokens(self, text: str) -> int: ...
+
+    def truncate(self, text: str, target_length: int) -> str:
+        max_chars = target_length * 8
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        current = self.count_tokens(text)
+        if current <= target_length:
+            return text
+        keep_ratio = target_length / current
+        return text[: max(1, int(len(text) * keep_ratio))]

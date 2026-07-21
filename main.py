@@ -71,6 +71,9 @@ def parse_args():
     parser.add_argument("--max-concurrency", type=int, default=2,
                         help="Max concurrent API requests per provider (default: 2). "
                              "Forced to 1 when requested_context_tokens >= 256k.")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Run ID for persistence/resume. Omit to auto-generate. "
+                             "Pass an existing ID to resume a previous run.")
 
     return parser.parse_args()
 
@@ -100,13 +103,20 @@ def main():
     setup_logging()
     args = parse_args()
     logger = logging.getLogger(__name__)
-    
+
+    # --- API-backend pipeline (Phase 2): persistence, resume, cost tracking ---
+    if args.model_spec:
+        from src.pipeline import run_backend_pipeline
+        run_backend_pipeline(args)
+        return
+
+    # --- Legacy local-HF pipeline (unchanged) ---
     logger.info("Starting Hallucination Evaluation Pipeline")
     logger.info(f"Target Models: {args.models}")
     logger.info(f"Judge Model: {args.judge_model}")
     logger.info(f"Context Lengths: {args.context_lengths}")
     logger.info(f"Samples per length: {args.samples}")
-    
+
     # Validate that per-model revisions, if supplied, line up with the model list
     if args.model_revisions is not None and len(args.model_revisions) != len(args.models):
         logger.error(

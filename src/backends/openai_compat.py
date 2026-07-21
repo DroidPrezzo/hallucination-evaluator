@@ -134,3 +134,18 @@ class OpenAICompatBackend(ModelBackend):
             return len(enc.encode(text))
         except (KeyError, ImportError):
             return max(1, len(text) // 4)
+
+    def truncate(self, text: str, target_length: int) -> str:
+        try:
+            import tiktoken
+
+            enc = tiktoken.encoding_for_model(self._model_id)
+            max_chars = target_length * 8
+            if len(text) > max_chars:
+                text = text[:max_chars]
+            tokens = enc.encode(text)
+            if len(tokens) <= target_length:
+                return text
+            return enc.decode(tokens[:target_length])
+        except (KeyError, ImportError):
+            return super().truncate(text, target_length)
