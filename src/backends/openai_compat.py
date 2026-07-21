@@ -67,6 +67,14 @@ class OpenAICompatBackend(ModelBackend):
         self._client = openai.OpenAI(**kwargs)
         self._retry_config = RetryConfig()
 
+        self._tiktoken_enc = None
+        try:
+            import tiktoken
+
+            self._tiktoken_enc = tiktoken.encoding_for_model(model_id)
+        except (KeyError, ImportError):
+            pass
+
     @property
     def model_id(self) -> str:
         return self._model_id
@@ -126,26 +134,22 @@ class OpenAICompatBackend(ModelBackend):
             ),
         )
 
-    def count_tokens(self, text: str) -> int:
-        try:
-            import tiktoken
+    def needs_calibration(self) -> bool:
+        return self._tiktoken_enc is None and self._chars_per_token is None
 
-            enc = tiktoken.encoding_for_model(self._model_id)
-            return len(enc.encode(text))
-        except (KeyError, ImportError):
-            return max(1, len(text) // 4)
+    def count_tokens(self, text: str) -> int:
+        if self._tiktoken_enc is not None:
+            return len(self._tiktoken_enc.encode(text))
+        ratio = self._chars_per_token or 4.0
+        return max(1, int(len(text) / ratio))
 
     def truncate(self, text: str, target_length: int) -> str:
-        try:
-            import tiktoken
-
-            enc = tiktoken.encoding_for_model(self._model_id)
+        if self._tiktoken_enc is not None:
             max_chars = target_length * 8
             if len(text) > max_chars:
                 text = text[:max_chars]
-            tokens = enc.encode(text)
+            tokens = self._tiktoken_enc.encode(text)
             if len(tokens) <= target_length:
                 return text
-            return enc.decode(tokens[:target_length])
-        except (KeyError, ImportError):
-            return super().truncate(text, target_length)
+            return self._tiktoken_enc.decode(tokens[:target_length])
+        return super().truncate(text, target_length)

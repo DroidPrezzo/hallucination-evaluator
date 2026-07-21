@@ -119,7 +119,9 @@ class AnthropicBackend(ModelBackend):
             ),
         )
 
+    def needs_calibration(self) -> bool:
+        return self._chars_per_token is None
+
     def count_tokens(self, text: str) -> int:
-        # No local Anthropic tokenizer; approximate at ~4 chars/token.
-        # Phase 3 calibrates per-model ratios from live API calls.
-        return max(1, len(text) // 4)
+        ratio = self._chars_per_token or 4.0
+        return max(1, int(len(text) / ratio))

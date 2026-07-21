@@ -63,6 +63,11 @@ def run_backend_pipeline(args) -> None:
         revision=dataset_revision,
     )
 
+    existing_config = store.load_config()
+    calibrations: dict[str, float] = (
+        existing_config.get("calibrations", {}) if existing_config else {}
+    )
+
     config = {
         "run_id": run_id,
         "model_specs": args.model_spec,
@@ -74,6 +79,7 @@ def run_backend_pipeline(args) -> None:
         "judge_prompt_version": JUDGE_PROMPT_VERSION,
         "git_commit": _git_commit_hash(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "calibrations": calibrations,
         "dataset": {
             "name": "tau/scrolls",
             "subset": "gov_report",
@@ -97,6 +103,18 @@ def run_backend_pipeline(args) -> None:
             spec, cache_dir=getattr(args, "cache_dir", None)
         )
 
+        if backend.needs_calibration():
+            if spec in calibrations:
+                backend._chars_per_token = calibrations[spec]
+                logger.info(
+                    "Loaded calibration for %s: %.2f chars/tok", spec, calibrations[spec]
+                )
+            else:
+                ratio = backend.calibrate()
+                calibrations[spec] = round(ratio, 4)
+                config["calibrations"] = calibrations
+                store.save_config(config)
+
         total = len(args.context_lengths) * actual_samples
         with tqdm(total=total, desc=spec, unit="gen") as pbar:
             for length in args.context_lengths:
@@ -113,6 +131,8 @@ def run_backend_pipeline(args) -> None:
                     source_sha = hashlib.sha256(context.encode()).hexdigest()
                     prompt = build_summarize_prompt(context)
 
+                    local_token_count = backend.count_tokens(prompt)
+
                     try:
                         result = backend.generate(
                             prompt,
@@ -127,7 +147,8 @@ def run_backend_pipeline(args) -> None:
                             "corpus": "scrolls",
                             "model_spec": spec,
                             "requested_context_tokens": length,
-                            "actual_input_tokens_model_tokenizer": result.input_tokens,
+                            "actual_input_tokens_model_tokenizer": local_token_count,
+                            "provider_reported_input_tokens": result.input_tokens,
                             "prompt_version": PROMPT_VERSION,
                             "output_text": result.text,
                             "usage": {
@@ -148,7 +169,8 @@ def run_backend_pipeline(args) -> None:
                             "corpus": "scrolls",
                             "model_spec": spec,
                             "requested_context_tokens": length,
-                            "actual_input_tokens_model_tokenizer": 0,
+                            "actual_input_tokens_model_tokenizer": local_token_count,
+                            "provider_reported_input_tokens": None,
                             "prompt_version": PROMPT_VERSION,
                             "output_text": None,
                             "error": str(exc),
@@ -176,6 +198,20 @@ def run_backend_pipeline(args) -> None:
     else:
         logger.info("PHASE 2: Judging with %s", judge_spec)
         judge_backend = create_backend(judge_spec)
+
+        if judge_backend.needs_calibration():
+            if judge_spec in calibrations:
+                judge_backend._chars_per_token = calibrations[judge_spec]
+                logger.info(
+                    "Loaded calibration for judge %s: %.2f chars/tok",
+                    judge_spec, calibrations[judge_spec],
+                )
+            else:
+                ratio = judge_backend.calibrate()
+                calibrations[judge_spec] = round(ratio, 4)
+                config["calibrations"] = calibrations
+                store.save_config(config)
+
         generations = store.load_generations()
         contexts = store.load_contexts()
 
@@ -201,6 +237,7 @@ def run_backend_pipeline(args) -> None:
                 )
 
             prompt = build_judge_prompt(source_text, gen["output_text"])
+            local_judge_tokens = judge_backend.count_tokens(prompt)
 
             try:
                 result = judge_backend.generate(
@@ -227,7 +264,8 @@ def run_backend_pipeline(args) -> None:
                     "verdict": verdict,
                     "raw_response": result.text,
                     "usage": {
-                        "input_tokens": result.input_tokens,
+                        "input_tokens": local_judge_tokens,
+                        "provider_reported_input_tokens": result.input_tokens,
                         "output_tokens": result.output_tokens,
                     },
                     "latency_s": result.latency_s,
@@ -245,7 +283,11 @@ def run_backend_pipeline(args) -> None:
                     "verdict": None,
                     "error": str(exc),
                     "raw_response": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "usage": {
+                        "input_tokens": local_judge_tokens,
+                        "provider_reported_input_tokens": None,
+                        "output_tokens": 0,
+                    },
                     "latency_s": 0,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "cost_estimate_usd": None,
