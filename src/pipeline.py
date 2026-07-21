@@ -12,14 +12,19 @@ from typing import Any, Callable, Optional
 from tqdm import tqdm
 
 from src.backends import ModelBackend, create_backend
+from src.backends.base import GenerationResult
 from src.context_builder import ContextBuilder
+from src.judging import decompose_summary, select_source, verify_claim
+from src.judging.claims import DECOMPOSE_MAX_TOKENS, VERIFY_MAX_TOKENS
 from src.leaderboard import LeaderboardGenerator
 from src.persistence import RunStore
 from src.prompts import (
+    DECOMPOSE_PROMPT_VERSION,
     JUDGE_PROMPT_VERSION,
     JUDGE_SYSTEM,
     PROMPT_VERSION,
     SUMMARIZE_SYSTEM,
+    VERIFY_PROMPT_VERSION,
     build_judge_prompt,
     build_summarize_prompt,
 )
@@ -58,6 +63,21 @@ def _judgment_key(
 ) -> str:
     raw = f"{generation_key}|{judge_spec}|{judge_prompt_version}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _decompose_key(generation_key: str, decomposer_spec: str) -> str:
+    raw = f"{generation_key}|{decomposer_spec}|{DECOMPOSE_PROMPT_VERSION}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _verify_key(generation_key: str, claim_id: int, judge_spec: str) -> str:
+    raw = f"{generation_key}|{claim_id}|{judge_spec}|{VERIFY_PROMPT_VERSION}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _sum_costs(results: list[GenerationResult]) -> Optional[float]:
+    costs = [r.cost_estimate_usd for r in results if r.cost_estimate_usd is not None]
+    return round(sum(costs), 6) if costs else None
 
 
 def _effective_concurrency(provider: str, length: int, max_concurrency: int) -> int:
@@ -260,6 +280,120 @@ def _make_judge_worker(
     return worker
 
 
+def _make_decompose_worker(
+    backend: ModelBackend, decomposer_spec: str
+) -> Callable[[dict], dict]:
+    """Worker that extracts the shared claim set from one summary. Never raises;
+    a malformed-JSON or API failure becomes a judge_error record with 0 claims.
+    """
+
+    def worker(gen: dict) -> dict:
+        gen_key = gen["idempotency_key"]
+        base = {
+            "idempotency_key": _decompose_key(gen_key, decomposer_spec),
+            "generation_key": gen_key,
+            "decomposer_spec": decomposer_spec,
+            "decompose_prompt_version": DECOMPOSE_PROMPT_VERSION,
+        }
+        try:
+            claims, results = decompose_summary(backend, gen["output_text"])
+            usage = {
+                "input_tokens": sum(r.input_tokens for r in results),
+                "output_tokens": sum(r.output_tokens for r in results),
+            }
+            latency = round(sum(r.latency_s for r in results), 3)
+            cost = _sum_costs(results)
+            error = None if claims is not None else "malformed_json"
+            return {
+                **base,
+                "claims": claims or [],
+                "num_claims": len(claims) if claims else 0,
+                "error": error,
+                "usage": usage,
+                "latency_s": latency,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "cost_estimate_usd": cost,
+            }
+        except Exception as exc:
+            logger.error("Decomposition failed for %s: %s", gen_key[:12], exc)
+            return {
+                **base,
+                "claims": [],
+                "num_claims": 0,
+                "error": str(exc),
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "latency_s": 0,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "cost_estimate_usd": None,
+            }
+
+    return worker
+
+
+def _make_verify_worker(
+    backend: ModelBackend,
+    judge_spec: str,
+    contexts: dict[str, str],
+    retrieval_cfg: dict,
+) -> Callable[[tuple[dict, int, str]], dict]:
+    """Worker that verifies one claim against the (retrieved) source. Never
+    raises; missing context or an unparseable verdict becomes an error record.
+    """
+
+    def worker(task: tuple[dict, int, str]) -> dict:
+        gen, claim_id, claim_text = task
+        gen_key = gen["idempotency_key"]
+        base = {
+            "idempotency_key": _verify_key(gen_key, claim_id, judge_spec),
+            "generation_key": gen_key,
+            "claim_id": claim_id,
+            "claim_text": claim_text,
+            "judge_spec": judge_spec,
+            "verify_prompt_version": VERIFY_PROMPT_VERSION,
+        }
+
+        source = contexts.get(gen_key)
+        if source is None:
+            logger.error("Context missing for %s; verify error", gen_key[:12])
+            return {
+                **base, "verdict": None, "error": "context_missing",
+                "retrieved_chunk_ids": None, "raw_response": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0}, "latency_s": 0,
+                "timestamp": datetime.now(timezone.utc).isoformat(), "cost_estimate_usd": None,
+            }
+
+        try:
+            passage, chunk_ids = select_source(
+                source, claim_text, count_tokens=backend.count_tokens, **retrieval_cfg
+            )
+            verdict, results = verify_claim(backend, passage, claim_text)
+            usage = {
+                "input_tokens": sum(r.input_tokens for r in results),
+                "output_tokens": sum(r.output_tokens for r in results),
+            }
+            return {
+                **base,
+                "verdict": verdict,
+                "error": None if verdict is not None else "unparseable_verdict",
+                "retrieved_chunk_ids": chunk_ids,
+                "raw_response": results[-1].text if results else None,
+                "usage": usage,
+                "latency_s": round(sum(r.latency_s for r in results), 3),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "cost_estimate_usd": _sum_costs(results),
+            }
+        except Exception as exc:
+            logger.error("Verify failed for %s claim %d: %s", gen_key[:12], claim_id, exc)
+            return {
+                **base, "verdict": None, "error": str(exc),
+                "retrieved_chunk_ids": None, "raw_response": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0}, "latency_s": 0,
+                "timestamp": datetime.now(timezone.utc).isoformat(), "cost_estimate_usd": None,
+            }
+
+    return worker
+
+
 def _apply_calibration(
     backend: ModelBackend,
     spec: str,
@@ -278,6 +412,113 @@ def _apply_calibration(
         calibrations[spec] = round(ratio, 4)
         config["calibrations"] = calibrations
         store.save_config(config)
+
+
+def _run_holistic(
+    store: RunStore,
+    judge_spec: str,
+    judgeable: list[dict],
+    contexts: dict[str, str],
+    calibrations: dict[str, float],
+    config: dict,
+    args: argparse.Namespace,
+) -> None:
+    logger.info("Judging (holistic) with %s", judge_spec)
+    backend = create_backend(judge_spec)
+    _apply_calibration(backend, judge_spec, calibrations, config, store)
+    worker = _make_judge_worker(backend, judge_spec, contexts)
+
+    pending = [
+        g for g in judgeable
+        if not store.has_judgment(
+            _judgment_key(g["idempotency_key"], judge_spec, JUDGE_PROMPT_VERSION)
+        )
+    ]
+    serial = [
+        g for g in pending
+        if _effective_concurrency(
+            backend.provider, g["requested_context_tokens"], args.max_concurrency
+        ) == 1
+    ]
+    concurrent = [g for g in pending if g not in serial]
+
+    with tqdm(total=len(pending), desc=f"holistic ({judge_spec})", unit="jdg") as pbar:
+        _process_concurrently(concurrent, worker, store.append_judgment, args.max_concurrency, pbar)
+        _process_concurrently(serial, worker, store.append_judgment, 1, pbar)
+
+    if hasattr(backend, "release"):
+        backend.release()
+
+
+def _run_decomposition(
+    store: RunStore,
+    decomposer_spec: str,
+    judgeable: list[dict],
+    calibrations: dict[str, float],
+    config: dict,
+    args: argparse.Namespace,
+) -> None:
+    logger.info("Decomposing summaries with %s", decomposer_spec)
+    backend = create_backend(decomposer_spec)
+    _apply_calibration(backend, decomposer_spec, calibrations, config, store)
+    worker = _make_decompose_worker(backend, decomposer_spec)
+
+    pending = [
+        g for g in judgeable
+        if not store.has_decomposition(
+            _decompose_key(g["idempotency_key"], decomposer_spec)
+        )
+    ]
+    # Summaries are short (<= GEN_MAX_TOKENS), so never hit the large-context rule.
+    conc = _effective_concurrency(backend.provider, 0, args.max_concurrency)
+    with tqdm(total=len(pending), desc=f"decompose ({decomposer_spec})", unit="dec") as pbar:
+        _process_concurrently(pending, worker, store.append_decomposition, conc, pbar)
+
+    if hasattr(backend, "release"):
+        backend.release()
+
+
+def _run_verification(
+    store: RunStore,
+    judge_spec: str,
+    judgeable: list[dict],
+    decompositions: dict[str, dict],
+    contexts: dict[str, str],
+    calibrations: dict[str, float],
+    config: dict,
+    args: argparse.Namespace,
+) -> None:
+    logger.info("Verifying claims with %s", judge_spec)
+    backend = create_backend(judge_spec)
+    _apply_calibration(backend, judge_spec, calibrations, config, store)
+
+    retrieval_cfg = {
+        "topk": args.verify_topk,
+        "chunk_size": args.verify_chunk_size,
+        "overlap": args.verify_chunk_overlap,
+        "full_source_threshold": args.verify_full_source_threshold,
+    }
+    worker = _make_verify_worker(backend, judge_spec, contexts, retrieval_cfg)
+
+    gen_by_key = {g["idempotency_key"]: g for g in judgeable}
+    tasks: list[tuple[dict, int, str]] = []
+    for gen_key, decomp in decompositions.items():
+        gen = gen_by_key.get(gen_key)
+        if gen is None:
+            continue
+        for claim_id, claim_text in enumerate(decomp["claims"]):
+            if store.has_verification(_verify_key(gen_key, claim_id, judge_spec)):
+                continue
+            tasks.append((gen, claim_id, claim_text))
+
+    # Verify prompts are bounded (top-k chunks or a sub-threshold source), so
+    # they never trip the large-context rule; concurrency = cap unless HF.
+    conc = _effective_concurrency(backend.provider, 0, args.max_concurrency)
+    with tqdm(total=len(tasks), desc=f"verify ({judge_spec})", unit="clm") as pbar:
+        _process_concurrently(tasks, worker, store.append_verification, conc, pbar)
+
+    if hasattr(backend, "release"):
+        backend.release()
 
 
 def run_backend_pipeline(args: argparse.Namespace) -> None:
@@ -301,25 +542,41 @@ def run_backend_pipeline(args: argparse.Namespace) -> None:
         existing_config.get("calibrations", {}) if existing_config else {}
     )
 
+    judge_specs: list[str] = args.judge_spec or []
+    decomposer_spec = args.decomposer_spec or (judge_specs[0] if judge_specs else None)
+
     config = {
         "run_id": run_id,
         "model_specs": args.model_spec,
-        "judge_spec": args.judge_spec,
+        "judge_specs": judge_specs,
+        "judge_mode": args.judge_mode,
+        "decomposer_spec": decomposer_spec,
         "context_lengths": args.context_lengths,
         "samples": args.samples,
         "max_concurrency": args.max_concurrency,
         "large_context_threshold": LARGE_CONTEXT_THRESHOLD,
         "prompt_version": PROMPT_VERSION,
         "judge_prompt_version": JUDGE_PROMPT_VERSION,
+        "decompose_prompt_version": DECOMPOSE_PROMPT_VERSION,
+        "verify_prompt_version": VERIFY_PROMPT_VERSION,
         "generation_params": {
             "max_tokens": GEN_MAX_TOKENS,
             "temperature": GEN_TEMPERATURE,
             "seed": GEN_SEED,
         },
         "judge_params": {
-            "max_tokens": JUDGE_MAX_TOKENS,
+            "holistic_max_tokens": JUDGE_MAX_TOKENS,
+            "decompose_max_tokens": DECOMPOSE_MAX_TOKENS,
+            "verify_max_tokens": VERIFY_MAX_TOKENS,
             "temperature": JUDGE_TEMPERATURE,
             "seed": GEN_SEED,
+        },
+        "retrieval": {
+            "topk": args.verify_topk,
+            "chunk_size": args.verify_chunk_size,
+            "overlap": args.verify_chunk_overlap,
+            "full_source_threshold": args.verify_full_source_threshold,
+            "scoring": "bm25",
         },
         "git_commit": _git_commit_hash(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -376,54 +633,43 @@ def run_backend_pipeline(args: argparse.Namespace) -> None:
             logger.info("Released resources for %s", spec)
 
     # ------------------------------------------------------------------
-    # Phase 2  —  Judging (separate phase: reads generations, writes judgments)
+    # Phase 2  —  Judging (separate phase: reads generations from disk)
     # ------------------------------------------------------------------
-    judge_spec = args.judge_spec
-    if not judge_spec:
+    rates: dict[str, dict[int, float]] = {}
+    if not judge_specs:
         logger.warning("No --judge-spec provided; skipping judgment phase.")
     else:
-        logger.info("PHASE 2: Judging with %s", judge_spec)
-        judge_backend = create_backend(judge_spec)
-        _apply_calibration(judge_backend, judge_spec, calibrations, config, store)
-
         generations = store.load_generations()
         contexts = store.load_contexts()
-        worker = _make_judge_worker(judge_backend, judge_spec, contexts)
+        judgeable = [g for g in generations if g.get("output_text") is not None]
 
-        pending_judgments: list[dict] = []
-        for gen in generations:
-            if gen.get("output_text") is None:
-                continue
-            jkey = _judgment_key(gen["idempotency_key"], judge_spec, JUDGE_PROMPT_VERSION)
-            if store.has_judgment(jkey):
-                continue
-            pending_judgments.append(gen)
-
-        # Large-context judgments (or an HF judge) must run alone; everything
-        # else runs concurrently. Run the concurrent batch first, then the
-        # serial batch, so per-provider in-flight requests never exceed the cap.
-        serial = [
-            g for g in pending_judgments
-            if _effective_concurrency(
-                judge_backend.provider, g["requested_context_tokens"], args.max_concurrency
-            ) == 1
-        ]
-        concurrent = [g for g in pending_judgments if g not in serial]
-
-        with tqdm(total=len(pending_judgments), desc=f"judge ({judge_spec})", unit="jdg") as pbar:
-            _process_concurrently(
-                concurrent, worker, store.append_judgment, args.max_concurrency, pbar
+        if args.judge_mode == "holistic":
+            logger.info("PHASE 2: Holistic judging (%d judge(s))", len(judge_specs))
+            for js in judge_specs:
+                _run_holistic(store, js, judgeable, contexts, calibrations, config, args)
+            rates = store.compute_hallucination_rates()
+        else:
+            logger.info(
+                "PHASE 2: Claim-level judging — decompose with %s, verify with %d judge(s)",
+                decomposer_spec, len(judge_specs),
             )
-            _process_concurrently(serial, worker, store.append_judgment, 1, pbar)
-
-        if hasattr(judge_backend, "release"):
-            judge_backend.release()
+            _run_decomposition(store, decomposer_spec, judgeable, calibrations, config, args)
+            decompositions = {
+                d["generation_key"]: d
+                for d in store.load_decompositions()
+                if d["decomposer_spec"] == decomposer_spec and not d.get("error")
+            }
+            for js in judge_specs:
+                _run_verification(
+                    store, js, judgeable, decompositions, contexts, calibrations, config, args
+                )
+            # Primary leaderboard uses the first judge; Phase 6 handles kappa.
+            rates = store.compute_claim_hallucination_rates(judge_specs[0])
 
     # ------------------------------------------------------------------
     # Phase 3  —  Leaderboard
     # ------------------------------------------------------------------
     logger.info("PHASE 3: Generating leaderboard")
-    rates = store.compute_hallucination_rates()
     if rates:
         LeaderboardGenerator(output_dir=args.output_dir).generate_leaderboard(rates)
 

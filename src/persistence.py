@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -19,15 +20,21 @@ class RunStore:
         self._judge_path = self.run_dir / "judgments.jsonl"
         self._config_path = self.run_dir / "config.json"
         self._contexts_path = self.run_dir / "contexts.jsonl"
+        self._decomp_path = self.run_dir / "decompositions.jsonl"
+        self._verify_path = self.run_dir / "verifications.jsonl"
 
         self._gen_keys: set[str] = set()
         self._judge_keys: set[str] = set()
+        self._decomp_keys: set[str] = set()
+        self._verify_keys: set[str] = set()
         self._load_existing_keys()
 
     def _load_existing_keys(self) -> None:
         for path, key_set in [
             (self._gen_path, self._gen_keys),
             (self._judge_path, self._judge_keys),
+            (self._decomp_path, self._decomp_keys),
+            (self._verify_path, self._verify_keys),
         ]:
             if not path.exists():
                 continue
@@ -38,8 +45,10 @@ class RunStore:
                         key_set.add(json.loads(line)["idempotency_key"])
         if self._gen_keys:
             logger.info(
-                "Resumed run %s: %d generations, %d judgments already on disk",
+                "Resumed run %s: %d generations, %d judgments, "
+                "%d decompositions, %d verifications already on disk",
                 self.run_id, len(self._gen_keys), len(self._judge_keys),
+                len(self._decomp_keys), len(self._verify_keys),
             )
 
     # ---- config ----
@@ -107,6 +116,40 @@ class RunStore:
         with open(self._judge_path) as f:
             return [json.loads(line) for line in f if line.strip()]
 
+    # ---- decompositions (claims mode) ----
+
+    def has_decomposition(self, key: str) -> bool:
+        return key in self._decomp_keys
+
+    def append_decomposition(self, record: dict) -> None:
+        with open(self._decomp_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+        self._decomp_keys.add(record["idempotency_key"])
+
+    def load_decompositions(self) -> list[dict]:
+        if not self._decomp_path.exists():
+            return []
+        with open(self._decomp_path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    # ---- verifications (claims mode) ----
+
+    def has_verification(self, key: str) -> bool:
+        return key in self._verify_keys
+
+    def append_verification(self, record: dict) -> None:
+        with open(self._verify_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+        self._verify_keys.add(record["idempotency_key"])
+
+    def load_verifications(self) -> list[dict]:
+        if not self._verify_path.exists():
+            return []
+        with open(self._verify_path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
     # ---- aggregation helpers ----
 
     def compute_hallucination_rates(self) -> dict[str, dict[int, float]]:
@@ -131,6 +174,45 @@ class RunStore:
                 results[model][length] = sum(verdicts) / len(verdicts) if verdicts else 0.0
         return results
 
+    def compute_claim_hallucination_rates(
+        self, judge_spec: str
+    ) -> dict[str, dict[int, float]]:
+        """Per (model_spec, length), mean over summaries of the per-summary
+        claim-level hallucination rate (unsupported / verified claims) for one
+        judge. Summaries with no successfully-verified claims are skipped.
+        """
+        generations = {g["idempotency_key"]: g for g in self.load_generations()}
+
+        per_gen: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"supported": 0, "unsupported": 0, "ambiguous": 0}
+        )
+        for v in self.load_verifications():
+            if v["judge_spec"] != judge_spec:
+                continue
+            verdict = v.get("verdict")
+            if verdict in ("supported", "unsupported", "ambiguous"):
+                per_gen[v["generation_key"]][verdict] += 1
+
+        groups: dict[str, dict[int, list[float]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for gen_key, counts in per_gen.items():
+            total = counts["supported"] + counts["unsupported"] + counts["ambiguous"]
+            if total == 0:
+                continue
+            gen = generations.get(gen_key)
+            if gen is None:
+                continue
+            rate = counts["unsupported"] / total
+            groups[gen["model_spec"]][gen["requested_context_tokens"]].append(rate)
+
+        results: dict[str, dict[int, float]] = {}
+        for model, lengths in groups.items():
+            results[model] = {
+                length: sum(rates) / len(rates) for length, rates in lengths.items()
+            }
+        return results
+
     def compute_cost_totals(self) -> dict[str, float]:
         totals: dict[str, float] = {}
         for gen in self.load_generations():
@@ -141,5 +223,15 @@ class RunStore:
             cost = j.get("cost_estimate_usd")
             if cost is not None:
                 key = f"{j['judge_spec']} (judge)"
+                totals[key] = totals.get(key, 0.0) + cost
+        for d in self.load_decompositions():
+            cost = d.get("cost_estimate_usd")
+            if cost is not None:
+                key = f"{d['decomposer_spec']} (decompose)"
+                totals[key] = totals.get(key, 0.0) + cost
+        for v in self.load_verifications():
+            cost = v.get("cost_estimate_usd")
+            if cost is not None:
+                key = f"{v['judge_spec']} (verify)"
                 totals[key] = totals.get(key, 0.0) + cost
         return totals

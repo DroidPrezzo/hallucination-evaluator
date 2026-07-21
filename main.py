@@ -65,9 +65,27 @@ def parse_args():
                              "anthropic:claude-opus-4-8, "
                              "openai:grok-4.5?base_url=https://api.x.ai/v1&key_env=XAI_API_KEY. "
                              "Overrides --models when set.")
-    parser.add_argument("--judge-spec", type=str, default=None,
-                        help="Judge model backend spec. E.g. anthropic:claude-opus-4-8. "
+    parser.add_argument("--judge-spec", action="append", default=None,
+                        help="Judge model backend spec (repeatable for cross-judge "
+                             "agreement). E.g. anthropic:claude-opus-4-8. "
                              "Overrides --judge-model when set.")
+    parser.add_argument("--judge-mode", choices=["holistic", "claims"], default="claims",
+                        help="Judging strategy for API runs. 'claims' decomposes each "
+                             "summary into atomic claims and verifies each (default); "
+                             "'holistic' is the legacy single YES/NO verdict.")
+    parser.add_argument("--decomposer-spec", type=str, default=None,
+                        help="Model spec that extracts the shared claim set in claims "
+                             "mode. Defaults to the first --judge-spec.")
+    parser.add_argument("--verify-topk", type=int, default=6,
+                        help="Claims mode: number of top BM25 source chunks to verify "
+                             "each claim against for long sources (default: 6).")
+    parser.add_argument("--verify-chunk-size", type=int, default=400,
+                        help="Claims mode: source chunk size in words (default: 400).")
+    parser.add_argument("--verify-chunk-overlap", type=int, default=80,
+                        help="Claims mode: chunk overlap in words (default: 80).")
+    parser.add_argument("--verify-full-source-threshold", type=int, default=8000,
+                        help="Claims mode: sources at/below this token count are sent "
+                             "whole instead of retrieved (default: 8000).")
     parser.add_argument("--max-concurrency", type=int, default=2,
                         help="Max concurrent API requests per provider (default: 2). "
                              "Forced to 1 when requested_context_tokens >= 256k.")
