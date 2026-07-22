@@ -56,8 +56,46 @@ def parse_args():
                         help="Load models in 4-bit quantization to save VRAM (requires bitsandbytes)")
     parser.add_argument("--use-8bit", action="store_true", 
                         help="Load models in 8-bit quantization to save VRAM")
-    parser.add_argument("--judge-4bit", action="store_true", 
+    parser.add_argument("--judge-4bit", action="store_true",
                         help="Load the Judge model in 4-bit even if test models aren't")
+
+    # --- API backend flags (Phase 1) ---
+    parser.add_argument("--model-spec", action="append", default=None,
+                        help="Model backend spec (repeatable). E.g. openai:gpt-5.5, "
+                             "anthropic:claude-opus-4-8, "
+                             "openai:grok-4.5?base_url=https://api.x.ai/v1&key_env=XAI_API_KEY. "
+                             "Overrides --models when set.")
+    parser.add_argument("--judge-spec", action="append", default=None,
+                        help="Judge model backend spec (repeatable for cross-judge "
+                             "agreement). E.g. anthropic:claude-opus-4-8. "
+                             "Overrides --judge-model when set.")
+    parser.add_argument("--judge-mode", choices=["holistic", "claims"], default="claims",
+                        help="Judging strategy for API runs. 'claims' decomposes each "
+                             "summary into atomic claims and verifies each (default); "
+                             "'holistic' is the legacy single YES/NO verdict.")
+    parser.add_argument("--decomposer-spec", type=str, default=None,
+                        help="Model spec that extracts the shared claim set in claims "
+                             "mode. Defaults to the first --judge-spec.")
+    parser.add_argument("--verify-topk", type=int, default=6,
+                        help="Claims mode: number of top BM25 source chunks to verify "
+                             "each claim against for long sources (default: 6).")
+    parser.add_argument("--verify-chunk-size", type=int, default=400,
+                        help="Claims mode: source chunk size in words (default: 400).")
+    parser.add_argument("--verify-chunk-overlap", type=int, default=80,
+                        help="Claims mode: chunk overlap in words (default: 80).")
+    parser.add_argument("--verify-full-source-threshold", type=int, default=8000,
+                        help="Claims mode: sources at/below this token count are sent "
+                             "whole instead of retrieved (default: 8000).")
+    parser.add_argument("--max-concurrency", type=int, default=2,
+                        help="Max concurrent API requests per provider (default: 2). "
+                             "Forced to 1 when requested_context_tokens >= 256k.")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Run ID for persistence/resume. Omit to auto-generate. "
+                             "Pass an existing ID to resume a previous run.")
+    parser.add_argument("--corpus", type=str, default=None,
+                        help="Path to a corpus JSONL built by scripts/build_corpus.py "
+                             "(contamination-safe docs/bundles). Overrides the default "
+                             "tau/scrolls dataset for API runs.")
 
     return parser.parse_args()
 
@@ -87,13 +125,20 @@ def main():
     setup_logging()
     args = parse_args()
     logger = logging.getLogger(__name__)
-    
+
+    # --- API-backend pipeline (Phase 2): persistence, resume, cost tracking ---
+    if args.model_spec:
+        from src.pipeline import run_backend_pipeline
+        run_backend_pipeline(args)
+        return
+
+    # --- Legacy local-HF pipeline (unchanged) ---
     logger.info("Starting Hallucination Evaluation Pipeline")
     logger.info(f"Target Models: {args.models}")
     logger.info(f"Judge Model: {args.judge_model}")
     logger.info(f"Context Lengths: {args.context_lengths}")
     logger.info(f"Samples per length: {args.samples}")
-    
+
     # Validate that per-model revisions, if supplied, line up with the model list
     if args.model_revisions is not None and len(args.model_revisions) != len(args.models):
         logger.error(

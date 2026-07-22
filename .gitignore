@@ -28,3 +28,6 @@ htmlcov/
 # (We might want to ignore intermediate results, but keep the folder structure)
 # results/*
 # !results/.gitkeep
+
+# Built corpora (potentially large; build locally with scripts/build_corpus.py)
+corpus/
