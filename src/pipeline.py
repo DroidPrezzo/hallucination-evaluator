@@ -7,6 +7,7 @@ import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 from tqdm import tqdm
@@ -709,3 +710,42 @@ def run_backend_pipeline(args: argparse.Namespace) -> None:
         store.save_config(config)
 
     logger.info("Run complete — id: %s  dir: %s", run_id, store.run_dir)
+
+
+def run_dry_run(args: argparse.Namespace) -> None:
+    """Run the entire pipeline offline on bundled fixtures with mock backends,
+    then analyze — no network, API keys, or GPU. Produces analysis.md +
+    curves.png so the whole generate -> judge -> analyze path can be exercised.
+    """
+    fixture = (Path(__file__).resolve().parent.parent
+               / "tests" / "fixtures" / "dry_run_corpus.jsonl")
+    if not fixture.exists():
+        raise FileNotFoundError(f"Dry-run fixture missing: {fixture}")
+
+    args.model_spec = ["mock:test-model-a", "mock:test-model-b"]
+    args.judge_spec = ["mock:judge-a", "mock:judge-b"]
+    args.judge_mode = getattr(args, "judge_mode", None) or "claims"
+    args.decomposer_spec = getattr(args, "decomposer_spec", None)
+    args.corpus = str(fixture)
+    args.context_lengths = [40, 80, 160]
+    args.samples = 4
+    args.max_concurrency = 2
+    args.run_id = getattr(args, "run_id", None) or "dry-run"
+    args.dataset_revision = None
+    args.cache_dir = None
+    args.verify_topk = getattr(args, "verify_topk", None) or 6
+    args.verify_chunk_size = getattr(args, "verify_chunk_size", None) or 400
+    args.verify_chunk_overlap = getattr(args, "verify_chunk_overlap", None) or 80
+    args.verify_full_source_threshold = getattr(args, "verify_full_source_threshold", None) or 8000
+    if getattr(args, "output_dir", None) is None:
+        args.output_dir = "results"
+
+    logger.info("DRY RUN: mock backends + fixture corpus, fully offline")
+    run_backend_pipeline(args)
+
+    from scripts.analyze import analyze_run
+
+    run_dir = Path(args.output_dir) / "runs" / args.run_id
+    out_dir, info = analyze_run(str(run_dir))
+    logger.info("DRY RUN complete: %s (analysis.md, curves.png, raw_summary.csv) — %s",
+                out_dir, info)

@@ -96,6 +96,10 @@ def parse_args():
                         help="Path to a corpus JSONL built by scripts/build_corpus.py "
                              "(contamination-safe docs/bundles). Overrides the default "
                              "tau/scrolls dataset for API runs.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Run the full pipeline offline with mock backends on "
+                             "bundled fixtures (generate -> judge -> analyze). "
+                             "No API keys, network, or GPU required.")
 
     return parser.parse_args()
 
@@ -125,6 +129,12 @@ def main():
     setup_logging()
     args = parse_args()
     logger = logging.getLogger(__name__)
+
+    # --- Offline dry run: mock backends + bundled fixtures, end to end ---
+    if args.dry_run:
+        from src.pipeline import run_dry_run
+        run_dry_run(args)
+        return
 
     # --- API-backend pipeline (Phase 2): persistence, resume, cost tracking ---
     if args.model_spec:

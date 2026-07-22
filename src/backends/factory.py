@@ -74,4 +74,9 @@ def create_backend(spec: str, **overrides: Any) -> ModelBackend:
             max_context=int(params["max_context"]) if "max_context" in params else None,
         )
 
+    if provider == "mock":
+        from .mock import MockBackend
+
+        return MockBackend(model_id=model_id)
+
     raise ValueError(f"Unknown provider '{provider}' in spec '{spec}'")
