@@ -9,6 +9,7 @@ from src.backends.base import GenerationResult, ModelBackend
 from src.prompts import (
     DECOMPOSE_SYSTEM,
     VERIFY_SYSTEM,
+    build_batch_verify_prompt,
     build_decompose_prompt,
     build_verify_prompt,
 )
@@ -17,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 DECOMPOSE_MAX_TOKENS = 2048
 VERIFY_MAX_TOKENS = 10
+# Batched verification returns a JSON array of {id, verdict}. Budget ~24 tokens
+# per claim plus slack; summaries decompose to at most a few dozen claims.
+VERIFY_BATCH_MAX_TOKENS = 1536
 
 VALID_VERDICTS = ("supported", "unsupported", "ambiguous")
 
@@ -83,6 +87,71 @@ def decompose_summary(
             return claims, results
         logger.warning("Malformed decomposition JSON (attempt %d/2)", attempt + 1)
     return None, results
+
+
+def parse_verdict_array(raw: str, n_claims: int) -> Optional[list[Optional[str]]]:
+    """Parse a batched verification response into per-claim verdicts.
+
+    Expects a JSON array of {"id": int, "verdict": str}. Returns a list of length
+    n_claims positioned by id (entries left None when missing/invalid), or None
+    when the response is not a JSON array at all (caller retries).
+    """
+    text = _FENCE_RE.sub("", raw).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+
+    verdicts: list[Optional[str]] = [None] * n_claims
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        cid, verdict = item.get("id"), item.get("verdict")
+        if not isinstance(cid, int) or not (0 <= cid < n_claims):
+            continue
+        if isinstance(verdict, str) and verdict.strip().lower() in VALID_VERDICTS:
+            verdicts[cid] = verdict.strip().lower()
+    return verdicts
+
+
+def verify_claims_batch(
+    backend: ModelBackend, source: str, claims: list[str]
+) -> tuple[list[Optional[str]], list[GenerationResult]]:
+    """Verify ALL of a summary's claims against the source in one API call.
+
+    Retries once if the array is unparseable or any claim is left unverified.
+    Returns (verdicts, results): verdicts is length-len(claims), positioned by
+    claim id, with None for any claim the judge failed to resolve (caller records
+    those as verify errors). results holds every GenerationResult for cost/usage.
+    """
+    if not claims:
+        return [], []
+    prompt = build_batch_verify_prompt(source, claims)
+    results: list[GenerationResult] = []
+    best: Optional[list[Optional[str]]] = None
+    for attempt in range(2):
+        result = backend.generate(
+            prompt,
+            max_tokens=VERIFY_BATCH_MAX_TOKENS,
+            temperature=0.0,
+            system_prompt=VERIFY_SYSTEM,
+        )
+        results.append(result)
+        parsed = parse_verdict_array(result.text, len(claims))
+        if parsed is not None:
+            best = parsed
+            if all(v is not None for v in parsed):
+                return parsed, results
+        logger.warning(
+            "Batched verify incomplete/unparseable (attempt %d/2)", attempt + 1
+        )
+    return (best if best is not None else [None] * len(claims)), results
 
 
 def verify_claim(

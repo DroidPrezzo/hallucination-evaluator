@@ -88,7 +88,18 @@ class AnthropicBackend(ModelBackend):
             "messages": [{"role": "user", "content": prompt}],
         }
         if system_prompt:
-            kwargs["system"] = system_prompt
+            # Prompt caching (#2): the system prompt/rubric is byte-identical
+            # across every call, so mark it as a cache breakpoint. Anthropic only
+            # caches prefixes at/above its minimum cacheable length, so for the
+            # current short rubrics this is a harmless no-op that starts paying
+            # off once the cached prefix grows (e.g. nested-prefix bundles).
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
 
         def _call() -> anthropic.types.Message:
             return self._client.messages.create(**kwargs)

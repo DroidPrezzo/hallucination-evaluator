@@ -31,3 +31,14 @@ htmlcov/
 
 # Built corpora (potentially large; build locally with scripts/build_corpus.py)
 corpus/
+
+# Per-run outputs (results/leaderboard.* at the root stay tracked)
+results/runs/
+
+# Raw corpus sources under scripts/raw/:
+#  - Save-Page-As asset dirs (images/js) are extraction cruft
+scripts/raw/*/*_files/
+#  - re-fetchable API downloads can be large (10-Ks are tens of MB); regenerate via the fetchers
+scripts/raw/*/fedreg_*
+scripts/raw/*/sec_*
+#  Manually-saved GAO source HTML is tracked (irreplaceable); manifest.csv is tracked.

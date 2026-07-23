@@ -16,8 +16,13 @@ from src.backends import ModelBackend, create_backend
 from src.backends.base import GenerationResult
 from src.context_builder import ContextBuilder
 from src.corpus import Corpus, ScrollsSource
-from src.judging import decompose_summary, select_source, verify_claim
-from src.judging.claims import DECOMPOSE_MAX_TOKENS, VERIFY_MAX_TOKENS
+from src.judging import decompose_summary, verify_claims_batch
+from src.judging.claims import (
+    DECOMPOSE_MAX_TOKENS,
+    VERIFY_BATCH_MAX_TOKENS,
+    VERIFY_MAX_TOKENS,
+)
+from src.judging.retrieval import _CHUNK_SEPARATOR, bm25_topk, build_chunks
 from src.leaderboard import LeaderboardGenerator
 from src.persistence import RunStore
 from src.prompts import (
@@ -341,66 +346,113 @@ def _make_decompose_worker(
     return worker
 
 
+def _verify_passage(
+    backend: ModelBackend, source: str, claims: list[str], retrieval_cfg: dict
+) -> tuple[str, list[Optional[list[int]]]]:
+    """Build the ONE source passage the batched judge call sees, plus each
+    claim's own retrieved chunk ids (for the validation excerpt).
+
+    The full-source-vs-retrieval decision is per summary (the source length is
+    fixed across its claims). Under the threshold: send the whole source once.
+    Over it: send the UNION of every claim's top-k chunks once, so a single call
+    still sees the evidence for all claims instead of re-sending per claim.
+    """
+    if backend.count_tokens(source) <= retrieval_cfg["full_source_threshold"]:
+        return source, [None] * len(claims)
+
+    chunks = build_chunks(source, retrieval_cfg["chunk_size"], retrieval_cfg["overlap"])
+    per_claim_ids: list[Optional[list[int]]] = []
+    union: set[int] = set()
+    for claim in claims:
+        ids = [idx for idx, _ in bm25_topk(chunks, claim, retrieval_cfg["topk"])]
+        per_claim_ids.append(ids)
+        union.update(ids)
+    by_index = {c.index: c.text for c in chunks}
+    passage = _CHUNK_SEPARATOR.join(by_index[i] for i in sorted(union))
+    return passage, per_claim_ids
+
+
 def _make_verify_worker(
     backend: ModelBackend,
     judge_spec: str,
     contexts: dict[str, str],
     retrieval_cfg: dict,
-) -> Callable[[tuple[dict, int, str]], dict]:
-    """Worker that verifies one claim against the (retrieved) source. Never
-    raises; missing context or an unparseable verdict becomes an error record.
+) -> Callable[[tuple[dict, list[str]]], list[dict]]:
+    """Worker that verifies ALL of one summary's claims in a single API call and
+    returns one record per claim. Never raises; missing context or an
+    unparseable batch becomes per-claim error records.
+
+    The single batch call's usage/latency/cost are attributed to the first
+    returned record so run-level cost totals count the call exactly once; the
+    other claim records carry the verdict only.
     """
 
-    def worker(task: tuple[dict, int, str]) -> dict:
-        gen, claim_id, claim_text = task
-        gen_key = gen["idempotency_key"]
-        base = {
+    def _rec(
+        gen_key: str, claim_id: int, claim_text: str, verdict: Optional[str],
+        error: Optional[str], chunk_ids: Optional[list[int]], raw: Optional[str],
+        usage: dict, latency: float, cost: Optional[float], ts: str,
+    ) -> dict:
+        return {
             "idempotency_key": _verify_key(gen_key, claim_id, judge_spec),
             "generation_key": gen_key,
             "claim_id": claim_id,
             "claim_text": claim_text,
             "judge_spec": judge_spec,
             "verify_prompt_version": VERIFY_PROMPT_VERSION,
+            "verdict": verdict,
+            "error": error,
+            "retrieved_chunk_ids": chunk_ids,
+            "raw_response": raw,
+            "usage": usage,
+            "latency_s": latency,
+            "timestamp": ts,
+            "cost_estimate_usd": cost,
         }
+
+    def worker(task: tuple[dict, list[str]]) -> list[dict]:
+        gen, claims = task
+        gen_key = gen["idempotency_key"]
+        ts = datetime.now(timezone.utc).isoformat()
+        zero = {"input_tokens": 0, "output_tokens": 0}
 
         source = contexts.get(gen_key)
         if source is None:
             logger.error("Context missing for %s; verify error", gen_key[:12])
-            return {
-                **base, "verdict": None, "error": "context_missing",
-                "retrieved_chunk_ids": None, "raw_response": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0}, "latency_s": 0,
-                "timestamp": datetime.now(timezone.utc).isoformat(), "cost_estimate_usd": None,
-            }
+            return [_rec(gen_key, i, c, None, "context_missing", None, None,
+                         dict(zero), 0, None, ts) for i, c in enumerate(claims)]
 
         try:
-            passage, chunk_ids = select_source(
-                source, claim_text, count_tokens=backend.count_tokens, **retrieval_cfg
+            passage, per_claim_ids = _verify_passage(
+                backend, source, claims, retrieval_cfg
             )
-            verdict, results = verify_claim(backend, passage, claim_text)
+            verdicts, results = verify_claims_batch(backend, passage, claims)
             usage = {
                 "input_tokens": sum(r.input_tokens for r in results),
                 "output_tokens": sum(r.output_tokens for r in results),
             }
-            return {
-                **base,
-                "verdict": verdict,
-                "error": None if verdict is not None else "unparseable_verdict",
-                "retrieved_chunk_ids": chunk_ids,
-                "raw_response": results[-1].text if results else None,
-                "usage": usage,
-                "latency_s": round(sum(r.latency_s for r in results), 3),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "cost_estimate_usd": _sum_costs(results),
-            }
+            latency = round(sum(r.latency_s for r in results), 3)
+            cost = _sum_costs(results)
+            raw = results[-1].text if results else None
+
+            recs = []
+            for i, claim_text in enumerate(claims):
+                verdict = verdicts[i] if i < len(verdicts) else None
+                first = i == 0
+                recs.append(_rec(
+                    gen_key, i, claim_text, verdict,
+                    None if verdict is not None else "unparseable_verdict",
+                    per_claim_ids[i],
+                    raw if first else None,
+                    usage if first else dict(zero),
+                    latency if first else 0,
+                    cost if first else None,
+                    ts,
+                ))
+            return recs
         except Exception as exc:
-            logger.error("Verify failed for %s claim %d: %s", gen_key[:12], claim_id, exc)
-            return {
-                **base, "verdict": None, "error": str(exc),
-                "retrieved_chunk_ids": None, "raw_response": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0}, "latency_s": 0,
-                "timestamp": datetime.now(timezone.utc).isoformat(), "cost_estimate_usd": None,
-            }
+            logger.error("Batched verify failed for %s: %s", gen_key[:12], exc)
+            return [_rec(gen_key, i, c, None, str(exc), None, None,
+                         dict(zero), 0, None, ts) for i, c in enumerate(claims)]
 
     return worker
 
@@ -511,22 +563,37 @@ def _run_verification(
     }
     worker = _make_verify_worker(backend, judge_spec, contexts, retrieval_cfg)
 
+    # One task per summary (all its claims verified in a single batched call).
+    # A summary is pending unless every one of its claim verdicts is already on
+    # disk, so resume is exact.
     gen_by_key = {g["idempotency_key"]: g for g in judgeable}
-    tasks: list[tuple[dict, int, str]] = []
+    tasks: list[tuple[dict, list[str]]] = []
     for gen_key, decomp in decompositions.items():
         gen = gen_by_key.get(gen_key)
         if gen is None:
             continue
-        for claim_id, claim_text in enumerate(decomp["claims"]):
-            if store.has_verification(_verify_key(gen_key, claim_id, judge_spec)):
-                continue
-            tasks.append((gen, claim_id, claim_text))
+        claims = decomp["claims"]
+        if not claims:
+            continue
+        if all(
+            store.has_verification(_verify_key(gen_key, cid, judge_spec))
+            for cid in range(len(claims))
+        ):
+            continue
+        tasks.append((gen, claims))
 
-    # Verify prompts are bounded (top-k chunks or a sub-threshold source), so
-    # they never trip the large-context rule; concurrency = cap unless HF.
+    def _persist(records: list[dict]) -> None:
+        # The worker returns one record per claim; append only those not already
+        # present so a crash mid-summary can't duplicate the append-only log.
+        for r in records:
+            if not store.has_verification(r["idempotency_key"]):
+                store.append_verification(r)
+
+    # Verify prompts are bounded (top-k chunk union or a sub-threshold source),
+    # so they never trip the large-context rule; concurrency = cap unless HF.
     conc = _effective_concurrency(backend.provider, 0, args.max_concurrency)
-    with tqdm(total=len(tasks), desc=f"verify ({judge_spec})", unit="clm") as pbar:
-        _process_concurrently(tasks, worker, store.append_verification, conc, pbar)
+    with tqdm(total=len(tasks), desc=f"verify ({judge_spec})", unit="sum") as pbar:
+        _process_concurrently(tasks, worker, _persist, conc, pbar)
 
     if hasattr(backend, "release"):
         backend.release()
@@ -590,6 +657,8 @@ def run_backend_pipeline(args: argparse.Namespace) -> None:
             "holistic_max_tokens": JUDGE_MAX_TOKENS,
             "decompose_max_tokens": DECOMPOSE_MAX_TOKENS,
             "verify_max_tokens": VERIFY_MAX_TOKENS,
+            "verify_batch_max_tokens": VERIFY_BATCH_MAX_TOKENS,
+            "verify_batched": True,
             "temperature": JUDGE_TEMPERATURE,
             "seed": GEN_SEED,
         },
