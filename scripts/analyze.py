@@ -433,6 +433,55 @@ def write_analysis_md(path: Path, config: dict, mode: str, judge_spec: str,
 
 # ---------------------------------------------------------------------------
 
+def analyze_run(run_dir, *, baseline_length: int = 1000, delta: float = 0.10,
+                bootstrap: int = 1000, seed: int = 0,
+                judge_spec: Optional[str] = None, output_dir=None):
+    """Analyze a run directory; writes analysis.md, curves.png, raw_summary.csv.
+
+    Returns (out_dir, info). Raises ValueError if there is nothing to analyze."""
+    n_boot = max(1000, bootstrap)
+    run_dir = Path(run_dir)
+    config = json.loads((run_dir / "config.json").read_text())
+    run_id = config.get("run_id", run_dir.name)
+    store = RunStore(run_id, str(run_dir.parent.parent))
+
+    judge_spec = judge_spec or (config.get("judge_specs") or [None])[0]
+    if judge_spec is None:
+        raise ValueError("No judge spec in config; pass judge_spec.")
+
+    obs, mode = collect_observations(store, config, judge_spec)
+    if not obs:
+        raise ValueError(f"No judged summaries for judge '{judge_spec}' in {run_dir}.")
+
+    out_dir = Path(output_dir) if output_dir else run_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pooled = aggregate_cells(obs, n_boot, seed, by_contamination=False)
+    efc_by_model = {
+        model: compute_efc({L: c["mean"] for L, c in series.items()},
+                           baseline_length, delta)
+        for model, series in pooled.items()
+    }
+
+    contam_classes = {o["contamination_risk"] for o in obs}
+    multi_contam = len(contam_classes) > 1
+    plot_cells = (aggregate_cells(obs, n_boot, seed, by_contamination=True)
+                  if multi_contam else pooled)
+
+    cost_totals = store.compute_cost_totals()
+    kappa_rows = kappa_table(store, config)
+
+    title = f"Faithfulness vs context — {mode} judge ({_short_spec(judge_spec)})"
+    plot_curves(plot_cells, out_dir / "curves.png", title, multi_contam)
+    write_raw_csv(obs, out_dir / "raw_summary.csv", n_boot, seed)
+    write_analysis_md(out_dir / "analysis.md", config, mode, judge_spec, pooled,
+                      efc_by_model, obs, cost_totals, kappa_rows,
+                      baseline_length, delta, n_boot, seed)
+
+    return out_dir, {"mode": mode, "judge": judge_spec, "models": len(pooled),
+                     "observations": len(obs), "bootstrap": n_boot}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -448,49 +497,17 @@ def main() -> None:
                         help="Where to write outputs (default: the run dir)")
     args = parser.parse_args()
 
-    n_boot = max(1000, args.bootstrap)
-    run_dir = Path(args.run_dir)
-    config = json.loads((run_dir / "config.json").read_text())
-    run_id = config.get("run_id", run_dir.name)
-    store = RunStore(run_id, str(run_dir.parent.parent))
-
-    judge_spec = args.judge_spec or (config.get("judge_specs") or [None])[0]
-    if judge_spec is None:
-        sys.exit("No judge spec in config; nothing to analyze. Pass --judge-spec.")
-
-    obs, mode = collect_observations(store, config, judge_spec)
-    if not obs:
-        sys.exit(f"No judged summaries found for judge '{judge_spec}' in {run_dir}.")
-
-    out_dir = Path(args.output_dir) if args.output_dir else run_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    pooled = aggregate_cells(obs, n_boot, args.seed, by_contamination=False)
-
-    efc_by_model = {
-        model: compute_efc({L: c["mean"] for L, c in series.items()},
-                           args.baseline_length, args.delta)
-        for model, series in pooled.items()
-    }
-
-    contam_classes = {o["contamination_risk"] for o in obs}
-    multi_contam = len(contam_classes) > 1
-    plot_cells = (aggregate_cells(obs, n_boot, args.seed, by_contamination=True)
-                  if multi_contam else pooled)
-
-    cost_totals = store.compute_cost_totals()
-    kappa_rows = kappa_table(store, config)
-
-    title = f"Faithfulness vs context — {mode} judge ({_short_spec(judge_spec)})"
-    plot_curves(plot_cells, out_dir / "curves.png", title, multi_contam)
-    write_raw_csv(obs, out_dir / "raw_summary.csv", n_boot, args.seed)
-    write_analysis_md(out_dir / "analysis.md", config, mode, judge_spec, pooled,
-                      efc_by_model, obs, cost_totals, kappa_rows,
-                      args.baseline_length, args.delta, n_boot, args.seed)
+    try:
+        out_dir, info = analyze_run(
+            args.run_dir, baseline_length=args.baseline_length, delta=args.delta,
+            bootstrap=args.bootstrap, seed=args.seed, judge_spec=args.judge_spec,
+            output_dir=args.output_dir)
+    except (ValueError, FileNotFoundError) as exc:
+        sys.exit(str(exc))
 
     print(f"Wrote analysis.md, curves.png, raw_summary.csv to {out_dir}")
-    print(f"  judge={judge_spec} mode={mode} models={len(pooled)} "
-          f"observations={len(obs)} bootstrap={n_boot}")
+    print(f"  judge={info['judge']} mode={info['mode']} models={info['models']} "
+          f"observations={info['observations']} bootstrap={info['bootstrap']}")
 
 
 if __name__ == "__main__":
