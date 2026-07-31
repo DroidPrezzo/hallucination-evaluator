@@ -43,3 +43,30 @@ models:
   deepseek-chat:
     input_per_1m: 0.27
     output_per_1m: 1.10
+
+  # base_url=https://api.deepseek.com/v1  key_env=DEEPSEEK_API_KEY
+  # Full list price: the 75%-off promo expired 2026-05-31, so DO NOT
+  # re-optimize these back down to the old ~0.28/1.10 promo rate.
+  deepseek-v4-pro:
+    input_per_1m: 1.74
+    output_per_1m: 3.48
+
+  deepseek-v4-flash:                 # TODO: UNVERIFIED placeholder — cheaper sibling; confirm rate on provider page
+    input_per_1m: 0.28
+    output_per_1m: 1.10
+
+  # --- Zhipu / Z.ai GLM (via OpenAI-compat) ---
+  # base_url=https://api.z.ai/api/paas/v4/  key_env=ZAI_API_KEY  (verified against docs.z.ai 2026-07-23)
+  glm-5.2:                           # TODO: UNVERIFIED rate — endpoint verified, price not yet
+    input_per_1m: 0.60
+    output_per_1m: 2.20
+
+  # --- Google Gemini (via OpenAI-compat endpoint) ---
+  # base_url=https://generativelanguage.googleapis.com/v1beta/openai/  key_env=GEMINI_API_KEY
+  gemini-3.1-pro-preview:            # TODO: UNVERIFIED placeholder — confirm on provider page
+    input_per_1m: 1.25
+    output_per_1m: 10.00
+    tiers:
+      - above_input_tokens: 200000
+        input_per_1m: 2.50
+        output_per_1m: 15.00

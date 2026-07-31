@@ -197,6 +197,62 @@ def kappa_table(store: RunStore, config: dict) -> Optional[list[dict]]:
     return rows
 
 
+# Pre-registered decision threshold — DO NOT change without protocol sign-off.
+JUDGE_KAPPA_THRESHOLD = 0.75
+
+
+def compute_judge_decision(
+    config: dict,
+    kappa_rows: Optional[list[dict]],
+    threshold: float = JUDGE_KAPPA_THRESHOLD,
+) -> Optional[dict]:
+    """Apply the pre-registered kappa gate.
+
+    kappa >= threshold -> the second judge adds no meaningfully different
+    verdicts, so drop to the single (primary) judge for the full run.
+    kappa <  threshold -> keep both judges. Applied automatically; the result
+    is logged to config.json + analysis.md either way.
+
+    Returns None when fewer than two judges ran (nothing to decide).
+    """
+    judges = config.get("judge_specs") or []
+    if not kappa_rows or len(judges) < 2:
+        return None
+
+    primary = judges[0]
+    # Use the pair involving the primary judge with the most items. For the
+    # two-judge pilot this is the only row.
+    candidate = [r for r in kappa_rows if primary in (r["judge_a"], r["judge_b"])]
+    row = max(candidate or kappa_rows, key=lambda r: r["n_items"])
+    kappa = row["kappa"]
+    kappa_defined = kappa == kappa  # False only for NaN
+
+    if not kappa_defined:
+        branch = "dual"
+        rationale = ("kappa undefined (verdicts lacked variation); defaulting to "
+                     "DUAL judges as the conservative branch.")
+    elif kappa >= threshold:
+        branch = "single"
+        rationale = (f"kappa {kappa:.3f} >= {threshold:.2f}: second judge adds no "
+                     "meaningfully different verdicts; DROP to single judge for the "
+                     "full run.")
+    else:
+        branch = "dual"
+        rationale = (f"kappa {kappa:.3f} < {threshold:.2f}: judges disagree enough to "
+                     "matter; KEEP both judges for the full run.")
+
+    return {
+        "pilot_kappa": None if not kappa_defined else round(kappa, 4),
+        "threshold": threshold,
+        "n_items": row["n_items"],
+        "judge_pair": [row["judge_a"], row["judge_b"]],
+        "primary_judge": primary,
+        "branch": branch,
+        "judges_for_full_run": [primary] if branch == "single" else list(judges),
+        "rationale": rationale,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -324,7 +380,7 @@ def write_analysis_md(path: Path, config: dict, mode: str, judge_spec: str,
                       pooled: dict, efc_by_model: dict, obs: list[dict],
                       cost_totals: dict, kappa_rows: Optional[list[dict]],
                       baseline_length: int, delta: float, n_boot: int,
-                      seed: int) -> None:
+                      seed: int, judge_decision: Optional[dict] = None) -> None:
     lines: list[str] = []
     lines.append(f"# Analysis — run `{config.get('run_id', '?')}`\n")
     lines.append("## Parameters (on the record)\n")
@@ -428,6 +484,27 @@ def write_analysis_md(path: Path, config: dict, mode: str, judge_spec: str,
         lines.append(_md_table(["judge A", "judge B", "kappa", "n_items"], rows))
     lines.append("")
 
+    lines.append("## Judge decision (pre-registered kappa gate)\n")
+    if judge_decision is None:
+        lines.append("Single judge (or no second judge ran); kappa gate not applied.")
+    else:
+        d = judge_decision
+        kv = "n/a" if d["pilot_kappa"] is None else f"{d['pilot_kappa']:.3f}"
+        lines.append(_md_table(
+            ["field", "value"],
+            [
+                ["pilot_kappa", kv],
+                ["threshold", f"{d['threshold']:.2f}"],
+                ["n_items", d["n_items"]],
+                ["branch", d["branch"]],
+                ["judges_for_full_run",
+                 ", ".join(_short_spec(j) for j in d["judges_for_full_run"])],
+            ],
+        ))
+        lines.append("")
+        lines.append(f"> {d['rationale']}")
+    lines.append("")
+
     path.write_text("\n".join(lines))
 
 
@@ -471,12 +548,20 @@ def analyze_run(run_dir, *, baseline_length: int = 1000, delta: float = 0.10,
     cost_totals = store.compute_cost_totals()
     kappa_rows = kappa_table(store, config)
 
+    # Pre-registered kappa gate: decide single-vs-dual judge for the full run
+    # and persist it to config.json so run_pilot.sh / the full run can read it.
+    decision = compute_judge_decision(config, kappa_rows)
+    if decision is not None:
+        config["judge_decision"] = decision
+        (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+
     title = f"Faithfulness vs context — {mode} judge ({_short_spec(judge_spec)})"
     plot_curves(plot_cells, out_dir / "curves.png", title, multi_contam)
     write_raw_csv(obs, out_dir / "raw_summary.csv", n_boot, seed)
     write_analysis_md(out_dir / "analysis.md", config, mode, judge_spec, pooled,
                       efc_by_model, obs, cost_totals, kappa_rows,
-                      baseline_length, delta, n_boot, seed)
+                      baseline_length, delta, n_boot, seed,
+                      judge_decision=decision)
 
     return out_dir, {"mode": mode, "judge": judge_spec, "models": len(pooled),
                      "observations": len(obs), "bootstrap": n_boot}

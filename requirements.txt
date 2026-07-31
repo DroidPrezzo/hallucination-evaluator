@@ -19,5 +19,9 @@ pyyaml>=6.0.1
 numpy>=1.26.0
 matplotlib>=3.8.0
 
+# --- Corpus building / download scripts ---
+beautifulsoup4>=4.12.0   # HTML->text extraction in build_corpus_from_manifest.py + fetchers
+requests>=2.32.0         # CVE-2024-35195: fixed in 2.32.0; used by the corpus fetchers
+
 # --- Testing (Phase 7) ---
 pytest>=8.0.0

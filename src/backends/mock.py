@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Optional
 
 from .base import GenerationResult, ModelBackend
@@ -65,8 +66,12 @@ class MockBackend(ModelBackend):
             text = self._decompose(prompt)
             out_tokens = self.count_tokens(text)
         elif "fact-checker" in sysp and "one word" in sysp:
-            text = self._verify(prompt)
-            out_tokens = 1
+            if "<claims>" in prompt:  # batched multi-claim verification
+                text = self._verify_batch(prompt)
+                out_tokens = self.count_tokens(text)
+            else:  # legacy single-claim verification (still used by tests)
+                text = self._verify(prompt)
+                out_tokens = 1
         elif "fact-checker" in sysp:  # holistic YES/NO judge
             text = "YES" if _h("holistic|" + prompt) % 2 == 0 else "NO"
             out_tokens = 1
@@ -98,11 +103,25 @@ class MockBackend(ModelBackend):
         claims = [f"The source asserts point {i} under reference {tag}." for i in range(3)]
         return json.dumps(claims)
 
-    def _verify(self, prompt: str) -> str:
+    def _verdict_for(self, prompt: str, claim_id: int) -> str:
         # Base signal is shared across judges (same prompt) so verdicts correlate;
         # a small per-judge flip keyed on model_id keeps kappa below 1.
-        base = _h("verify|" + prompt) % 100
+        base = _h(f"verify|{claim_id}|{prompt}") % 100
         verdict = "unsupported" if base < 35 else "supported"
-        if _h(self._model_id + "|flip|" + prompt) % 100 < 10:
+        if _h(f"{self._model_id}|flip|{claim_id}|{prompt}") % 100 < 10:
             verdict = "supported" if verdict == "unsupported" else "unsupported"
         return verdict
+
+    def _verify(self, prompt: str) -> str:
+        return self._verdict_for(prompt, 0)
+
+    def _verify_batch(self, prompt: str) -> str:
+        # Recover the claim ids from the <claims> block and emit one verdict each
+        # as the JSON array the batched parser expects.
+        m = re.search(r"<claims>\n(.*?)\n</claims>", prompt, re.S)
+        ids = [int(x) for x in re.findall(r"^(\d+):", m.group(1) if m else "", re.M)]
+        if not ids:
+            ids = [0]
+        return json.dumps(
+            [{"id": i, "verdict": self._verdict_for(prompt, i)} for i in ids]
+        )

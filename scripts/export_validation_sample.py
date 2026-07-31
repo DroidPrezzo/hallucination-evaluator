@@ -9,7 +9,7 @@ hidden (delete/collapse the column) during blind annotation.
 Usage:
     python scripts/export_validation_sample.py \
         --run-dir results/runs/<run_id> \
-        --n 200 \
+        --n 400 \
         --output validation_sample.csv
 """
 from __future__ import annotations
@@ -97,7 +97,8 @@ def _stratified_sample(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True, help="Path to results/runs/<run_id>")
-    parser.add_argument("--n", type=int, default=200, help="Number of claims to sample")
+    parser.add_argument("--n", type=int, default=400,
+                        help="Number of claims to sample (pre-registered target: ~400)")
     parser.add_argument("--judge-spec", default=None,
                         help="Which judge's verdicts to sample (default: first in config)")
     parser.add_argument("--seed", type=int, default=0, help="Sampling seed")
